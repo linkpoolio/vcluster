@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 
+	vclusterconfig "github.com/loft-sh/vcluster/config"
 	"github.com/loft-sh/vcluster/pkg/config"
 	"github.com/loft-sh/vcluster/pkg/constants"
 	"github.com/loft-sh/vcluster/pkg/etcd"
@@ -29,7 +30,21 @@ func (c *Client) Run(ctx context.Context) error {
 	// parse vCluster config
 	vConfig, err := config.ParseConfig(constants.DefaultVClusterConfigLocation, os.Getenv("VCLUSTER_NAME"), nil)
 	if err != nil {
-		return err
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("parse vCluster config: %w", err)
+		}
+		// Standalone places config at a different path than container deployments.
+		vConfig, err = config.ParseConfig(c.Options.ConfigPath, os.Getenv("VCLUSTER_NAME"), nil)
+		if err != nil {
+			return fmt.Errorf("parse standalone vCluster config: %w", err)
+		}
+
+		// Embedded etcd requires VCLUSTER_STANDALONE_IP_ADDRESS to identify the local peer.
+		if vConfig.BackingStoreType() == vclusterconfig.StoreTypeEmbeddedEtcd {
+			if _, ok := os.LookupEnv(constants.VClusterStandaloneIPAddressEnvVar); !ok {
+				return fmt.Errorf("could not determine the IP address for the embedded etcd peer")
+			}
+		}
 	}
 
 	// make sure to validate options
