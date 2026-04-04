@@ -231,7 +231,8 @@ func (s *podSyncer) SyncToHost(ctx *synccontext.SyncContext, event *synccontext.
 			}
 		} else {
 			// make sure the node does exist in the virtual cluster
-			err = ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: pPod.Spec.NodeName}, &corev1.Node{})
+			virtualNodeName := resolveVirtualNodeName(ctx, pPod.Spec.NodeName)
+			err = ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: virtualNodeName}, &corev1.Node{})
 			if err != nil {
 				if !kerrors.IsNotFound(err) {
 					return ctrl.Result{}, err
@@ -244,7 +245,7 @@ func (s *podSyncer) SyncToHost(ctx *synccontext.SyncContext, event *synccontext.
 					"SyncWarning",
 					fmt.Sprintf("Sync%s", event.Virtual.GetObjectKind().GroupVersionKind().Kind),
 					"Given nodeName %s does not exist in virtual cluster",
-					pPod.Spec.NodeName,
+					virtualNodeName,
 				)
 				return ctrl.Result{RequeueAfter: time.Second * 15}, nil
 			}
@@ -537,9 +538,30 @@ func (s *podSyncer) applyResizeSubresource(ctx *synccontext.SyncContext, hostPod
 	return ctx.HostClient.SubResource("resize").Patch(ctx, hostPod, client.RawPatch(types.StrategicMergePatchType, patch))
 }
 
+// resolveVirtualNodeName translates a host node name to its virtual name using the
+// registered node mapper. Returns the host name unchanged if no custom mapper exists.
+func resolveVirtualNodeName(ctx *synccontext.SyncContext, hostName string) string {
+	if ctx.Mappings == nil {
+		return hostName
+	}
+
+	nodeMapper, err := ctx.Mappings.ByGVK(corev1.SchemeGroupVersion.WithKind("Node"))
+	if err != nil {
+		return hostName
+	}
+
+	mapped := nodeMapper.HostToVirtual(ctx, types.NamespacedName{Name: hostName}, nil)
+	if mapped.Name == "" {
+		return hostName
+	}
+
+	return mapped.Name
+}
+
 func (s *podSyncer) ensureNode(ctx *synccontext.SyncContext, pObj *corev1.Pod, vObj *corev1.Pod) (bool, error) {
-	if vObj.Spec.NodeName != pObj.Spec.NodeName && vObj.Spec.NodeName != "" {
-		// node of virtual and physical pod are different, we delete the virtual pod to try to recover from this state
+	virtualNodeName := resolveVirtualNodeName(ctx, pObj.Spec.NodeName)
+
+	if vObj.Spec.NodeName != virtualNodeName && vObj.Spec.NodeName != "" {
 		_, err := patcher.DeleteVirtualObject(ctx, vObj, pObj, "virtual and physical pods have different assigned nodes")
 		if err != nil {
 			return false, err
@@ -551,17 +573,17 @@ func (s *podSyncer) ensureNode(ctx *synccontext.SyncContext, pObj *corev1.Pod, v
 	// ensure the node is available in the virtual cluster, if not and we sync the pod to the virtual cluster,
 	// it will get deleted automatically by kubernetes so we ensure the node is synced
 	vNode := &corev1.Node{}
-	err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: pObj.Spec.NodeName}, vNode)
+	err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: virtualNodeName}, vNode)
 	if err != nil {
 		if !kerrors.IsNotFound(err) {
-			ctx.Log.Infof("error retrieving virtual node %s: %v", pObj.Spec.NodeName, err)
+			ctx.Log.Infof("error retrieving virtual node %s: %v", virtualNodeName, err)
 			return false, err
 		}
 
 		return true, nil
 	}
 
-	if vObj.Spec.NodeName != pObj.Spec.NodeName {
+	if vObj.Spec.NodeName != virtualNodeName {
 		err = s.assignNodeToPod(ctx, pObj, vObj)
 		if err != nil {
 			return false, err
@@ -574,7 +596,8 @@ func (s *podSyncer) ensureNode(ctx *synccontext.SyncContext, pObj *corev1.Pod, v
 }
 
 func (s *podSyncer) assignNodeToPod(ctx *synccontext.SyncContext, pObj *corev1.Pod, vObj *corev1.Pod) error {
-	ctx.Log.Infof("bind virtual pod %s/%s to node %s, because node name between physical and virtual is different", vObj.Namespace, vObj.Name, pObj.Spec.NodeName)
+	virtualNodeName := resolveVirtualNodeName(ctx, pObj.Spec.NodeName)
+	ctx.Log.Infof("bind virtual pod %s/%s to node %s", vObj.Namespace, vObj.Name, virtualNodeName)
 	err := s.virtualClusterClient.CoreV1().Pods(vObj.Namespace).Bind(ctx, &corev1.Binding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      vObj.Name,
@@ -582,7 +605,7 @@ func (s *podSyncer) assignNodeToPod(ctx *synccontext.SyncContext, pObj *corev1.P
 		},
 		Target: corev1.ObjectReference{
 			Kind:       "Node",
-			Name:       pObj.Spec.NodeName,
+			Name:       virtualNodeName,
 			APIVersion: "v1",
 		},
 	}, metav1.CreateOptions{})
