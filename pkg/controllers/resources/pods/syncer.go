@@ -16,7 +16,6 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/loft-sh/vcluster/pkg/constants"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/nodes"
 	"github.com/loft-sh/vcluster/pkg/controllers/resources/pods/scheduling"
 	"github.com/loft-sh/vcluster/pkg/controllers/resources/pods/token"
 	"github.com/loft-sh/vcluster/pkg/mappings"
@@ -232,7 +231,7 @@ func (s *podSyncer) SyncToHost(ctx *synccontext.SyncContext, event *synccontext.
 			}
 		} else {
 			// make sure the node does exist in the virtual cluster
-			virtualNodeName := resolveVirtualNodeName(pPod.Spec.NodeName)
+			virtualNodeName := resolveVirtualNodeName(ctx, pPod.Spec.NodeName)
 			err = ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: virtualNodeName}, &corev1.Node{})
 			if err != nil {
 				if !kerrors.IsNotFound(err) {
@@ -539,12 +538,23 @@ func (s *podSyncer) applyResizeSubresource(ctx *synccontext.SyncContext, hostPod
 	return ctx.HostClient.SubResource("resize").Patch(ctx, hostPod, client.RawPatch(types.StrategicMergePatchType, patch))
 }
 
-func resolveVirtualNodeName(hostName string) string {
-	return nodes.ResolveVirtualNodeName(hostName)
+// resolveVirtualNodeName translates a host node name to the virtual node name
+// using the node mapper from the mappings registry. Falls back to the host name
+// if no custom mapper is registered or the mapper has no mapping.
+func resolveVirtualNodeName(ctx *synccontext.SyncContext, hostName string) string {
+	nodeMapper, err := ctx.Mappings.ByGVK(mappings.Nodes())
+	if err != nil {
+		return hostName
+	}
+	mapped := nodeMapper.HostToVirtual(ctx, types.NamespacedName{Name: hostName}, nil)
+	if mapped.Name == "" {
+		return hostName
+	}
+	return mapped.Name
 }
 
 func (s *podSyncer) ensureNode(ctx *synccontext.SyncContext, pObj *corev1.Pod, vObj *corev1.Pod) (bool, error) {
-	virtualNodeName := resolveVirtualNodeName(pObj.Spec.NodeName)
+	virtualNodeName := resolveVirtualNodeName(ctx, pObj.Spec.NodeName)
 
 	if vObj.Spec.NodeName != virtualNodeName && vObj.Spec.NodeName != "" {
 		_, err := patcher.DeleteVirtualObject(ctx, vObj, pObj, "virtual and physical pods have different assigned nodes")
@@ -581,7 +591,7 @@ func (s *podSyncer) ensureNode(ctx *synccontext.SyncContext, pObj *corev1.Pod, v
 }
 
 func (s *podSyncer) assignNodeToPod(ctx *synccontext.SyncContext, pObj *corev1.Pod, vObj *corev1.Pod) error {
-	virtualNodeName := resolveVirtualNodeName(pObj.Spec.NodeName)
+	virtualNodeName := resolveVirtualNodeName(ctx, pObj.Spec.NodeName)
 	ctx.Log.Infof("bind virtual pod %s/%s to node %s", vObj.Namespace, vObj.Name, virtualNodeName)
 	err := s.virtualClusterClient.CoreV1().Pods(vObj.Namespace).Bind(ctx, &corev1.Binding{
 		ObjectMeta: metav1.ObjectMeta{
