@@ -41,11 +41,6 @@ func NewSyncer(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
 		return nil, err
 	}
 
-	nodesMapper, err := ctx.Mappings.ByGVK(mappings.Nodes())
-	if err != nil {
-		return nil, err
-	}
-
 	return &persistentVolumeSyncer{
 		GenericTranslator: translator.NewGenericTranslator(ctx, "persistentvolume", &corev1.PersistentVolume{}, mapper),
 
@@ -54,7 +49,6 @@ func NewSyncer(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
 		},
 
 		virtualClient: ctx.VirtualManager.GetClient(),
-		nodesMapper:   nodesMapper,
 	}, nil
 }
 
@@ -81,26 +75,6 @@ type persistentVolumeSyncer struct {
 	syncertypes.GenericTranslator
 	virtualClient       client.Client
 	excludedAnnotations []string
-	nodesMapper         synccontext.Mapper
-}
-
-func (s *persistentVolumeSyncer) translatePVNodeAffinity(ctx *synccontext.SyncContext, pv *corev1.PersistentVolume) {
-	if s.nodesMapper == nil || pv.Spec.NodeAffinity == nil || pv.Spec.NodeAffinity.Required == nil {
-		return
-	}
-
-	for i := range pv.Spec.NodeAffinity.Required.NodeSelectorTerms {
-		term := &pv.Spec.NodeAffinity.Required.NodeSelectorTerms[i]
-		for j := range term.MatchExpressions {
-			expr := &term.MatchExpressions[j]
-			for k, val := range expr.Values {
-				mapped := s.nodesMapper.HostToVirtual(ctx, types.NamespacedName{Name: val}, nil)
-				if mapped.Name != "" && mapped.Name != val {
-					expr.Values[k] = mapped.Name
-				}
-			}
-		}
-	}
 }
 
 var _ syncertypes.ControllerModifier = &persistentVolumeSyncer{}
@@ -249,7 +223,6 @@ func (s *persistentVolumeSyncer) Sync(ctx *synccontext.SyncContext, event *syncc
 		event.HostOld.Spec.NodeAffinity,
 		event.Host.Spec.NodeAffinity,
 	)
-	s.translatePVNodeAffinity(ctx, event.Virtual)
 	event.Virtual.Spec.VolumeMode, event.Host.Spec.VolumeMode = patcher.CopyBidirectional(
 		event.VirtualOld.Spec.VolumeMode,
 		event.Virtual.Spec.VolumeMode,
