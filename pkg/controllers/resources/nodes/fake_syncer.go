@@ -10,7 +10,6 @@ import (
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	syncer "github.com/loft-sh/vcluster/pkg/syncer/types"
 	"k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/klog/v2"
 
 	"github.com/loft-sh/vcluster/pkg/controllers/resources/nodes/nodeservice"
 	podtranslate "github.com/loft-sh/vcluster/pkg/controllers/resources/pods/translate"
@@ -35,7 +34,6 @@ func NewFakeSyncer(ctx *synccontext.RegisterContext, nodeService nodeservice.Pro
 		nodeServiceProvider:  nodeService,
 		fakeKubeletIPs:       ctx.Config.Networking.Advanced.ProxyKubelets.ByIP,
 		fakeKubeletHostnames: ctx.Config.Networking.Advanced.ProxyKubelets.ByHostname,
-		translator:           newNodeNameTranslator(),
 	}, nil
 }
 
@@ -43,7 +41,6 @@ type fakeNodeSyncer struct {
 	nodeServiceProvider  nodeservice.Provider
 	fakeKubeletIPs       bool
 	fakeKubeletHostnames bool
-	translator           *nodeNameTranslator
 }
 
 func (r *fakeNodeSyncer) Resource() client.Object {
@@ -69,49 +66,21 @@ func (r *fakeNodeSyncer) ModifyController(ctx *synccontext.RegisterContext, buil
 var _ syncer.FakeSyncer = &fakeNodeSyncer{}
 
 func (r *fakeNodeSyncer) FakeSyncToVirtual(ctx *synccontext.SyncContext, name types.NamespacedName) (ctrl.Result, error) {
-	realName := name.Name
-
-	// The reconciler looks up nodes by the reconcile request name. When a host pod
-	// triggers reconciliation for a real hostname, the virtual node won't be found
-	// by that name because it has a translated name. Check if we already created a
-	// node for this host by looking up the hash label.
-	hash := HostNodeHash(realName)
-	nodeList := &corev1.NodeList{}
-	err := ctx.VirtualClient.List(ctx, nodeList, client.MatchingLabels{
-		HostNodeHashLabel: hash,
-	})
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if len(nodeList.Items) > 0 {
-		existing := &nodeList.Items[0]
-		r.translator.RegisterExisting(realName, existing.Name)
-		return r.FakeSync(ctx, existing)
-	}
-
-	needed, err := r.nodeNeeded(ctx, realName)
+	needed, err := r.nodeNeeded(ctx, name.Name)
 	if err != nil {
 		return ctrl.Result{}, err
 	} else if !needed {
 		return ctrl.Result{}, nil
 	}
 
-	virtualName := r.translator.Translate(realName)
-	klog.Infof("Create fake node %s (host: %s, hash: %s)", virtualName, realName, hash)
-	return ctrl.Result{}, createFakeNode(ctx, r.fakeKubeletIPs, r.fakeKubeletHostnames, r.nodeServiceProvider, ctx.VirtualClient, virtualName, realName)
+	ctx.Log.Infof("Create fake node %s", name.Name)
+	return ctrl.Result{}, createFakeNode(ctx, r.fakeKubeletIPs, r.fakeKubeletHostnames, r.nodeServiceProvider, ctx.VirtualClient, name.Name)
 }
 
 func (r *fakeNodeSyncer) FakeSync(ctx *synccontext.SyncContext, vObj client.Object) (ctrl.Result, error) {
 	node, ok := vObj.(*corev1.Node)
 	if !ok || node == nil {
 		return ctrl.Result{}, fmt.Errorf("%#v is not a node", vObj)
-	}
-
-	// Recover name mapping from annotation on restart
-	if node.Annotations != nil {
-		if realName, ok := node.Annotations[HostNodeNameAnnotation]; ok {
-			r.translator.RegisterExisting(realName, node.Name)
-		}
 	}
 
 	needed, err := r.nodeNeeded(ctx, node.Name)
@@ -166,21 +135,7 @@ func (r *fakeNodeSyncer) updateIfNeeded(ctx *synccontext.SyncContext, node *core
 }
 
 func (r *fakeNodeSyncer) nodeNeeded(ctx *synccontext.SyncContext, nodeName string) (bool, error) {
-	needed, err := isNodeNeededByPod(ctx, ctx.VirtualClient, ctx.HostClient, nodeName)
-	if err != nil || needed {
-		return needed, err
-	}
-
-	// Also check the complementary name: virtual pods use translated names,
-	// physical pods use real hostnames.
-	if virtualName, ok := r.translator.RealToVirtual(nodeName); ok {
-		return isNodeNeededByPod(ctx, ctx.VirtualClient, ctx.HostClient, virtualName)
-	}
-	if realName, ok := r.translator.VirtualToReal(nodeName); ok {
-		return isNodeNeededByPod(ctx, ctx.VirtualClient, ctx.HostClient, realName)
-	}
-
-	return false, nil
+	return isNodeNeededByPod(ctx, ctx.VirtualClient, ctx.HostClient, nodeName)
 }
 
 // this is not a real guid, but it doesn't really matter because it should just look right and not be an actual guid
@@ -194,28 +149,25 @@ func createFakeNode(
 	fakeKubeletHostnames bool,
 	nodeServiceProvider nodeservice.Provider,
 	virtualClient client.Client,
-	virtualName string,
-	realName string,
+	name string,
 ) error {
 	nodeServiceProvider.Lock()
 	defer nodeServiceProvider.Unlock()
 
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: virtualName,
+			Name: name,
 			Labels: map[string]string{
 				"vcluster.loft.sh/fake-node": "true",
-				HostNodeHashLabel:            HostNodeHash(realName),
 				"beta.kubernetes.io/arch":    runtime.GOARCH,
 				"beta.kubernetes.io/os":      "linux",
 				"kubernetes.io/arch":         runtime.GOARCH,
-				"kubernetes.io/hostname":     translate.SafeConcatName("fake", virtualName),
+				"kubernetes.io/hostname":     translate.SafeConcatName("fake", name),
 				"kubernetes.io/os":           "linux",
 			},
 			Annotations: map[string]string{
 				"node.alpha.kubernetes.io/ttl":                           "0",
 				"volumes.kubernetes.io/controller-managed-attach-detach": "false",
-				HostNodeNameAnnotation:                                   realName,
 			},
 		},
 	}
@@ -306,7 +258,7 @@ func createFakeNode(
 	}
 
 	if fakeKubeletIPs {
-		nodeIP, err := nodeServiceProvider.GetNodeIP(ctx, virtualName)
+		nodeIP, err := nodeServiceProvider.GetNodeIP(ctx, name)
 		if err != nil {
 			return fmt.Errorf("create fake node ip: %w", err)
 		}

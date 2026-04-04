@@ -48,10 +48,8 @@ func (f *fakeNodeServiceProvider) GetNodeIP(context.Context, string) (string, er
 func TestFakeSync(t *testing.T) {
 	fakeGUID := newGUID()
 	now := metav1.Now()
-	realName := "mynode"
-	translatedName := HostNodeHash(realName)
 	baseName := types.NamespacedName{
-		Name: realName,
+		Name: "mynode",
 	}
 	basePod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -63,20 +61,18 @@ func TestFakeSync(t *testing.T) {
 	}
 	baseNode := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: translatedName,
+			Name: baseName.Name,
 			Labels: map[string]string{
 				"vcluster.loft.sh/fake-node": "true",
-				HostNodeHashLabel:            HostNodeHash(realName),
 				"beta.kubernetes.io/arch":    goruntime.GOARCH,
 				"beta.kubernetes.io/os":      "linux",
 				"kubernetes.io/arch":         goruntime.GOARCH,
-				"kubernetes.io/hostname":     "fake-" + translatedName,
+				"kubernetes.io/hostname":     "fake-" + baseName.Name,
 				"kubernetes.io/os":           "linux",
 			},
 			Annotations: map[string]string{
 				"node.alpha.kubernetes.io/ttl":                           "0",
 				"volumes.kubernetes.io/controller-managed-attach-detach": "false",
-				HostNodeNameAnnotation:                                   realName,
 			},
 		},
 		Status: corev1.NodeStatus{
@@ -124,7 +120,7 @@ func TestFakeSync(t *testing.T) {
 			},
 			Addresses: []corev1.NodeAddress{
 				{
-					Address: GetNodeHost(translatedName),
+					Address: GetNodeHost(baseName.Name),
 					Type:    corev1.NodeHostName,
 				},
 			},
@@ -200,72 +196,5 @@ func TestFakeSync(t *testing.T) {
 				assert.NilError(t, err)
 			},
 		},
-	})
-}
-
-func TestNodeNameTranslator(t *testing.T) {
-	tr := newNodeNameTranslator()
-
-	t.Run("uses hash as virtual name", func(t *testing.T) {
-		name := tr.Translate("host-node-1")
-		assert.Equal(t, name, HostNodeHash("host-node-1"))
-	})
-
-	t.Run("idempotent", func(t *testing.T) {
-		a := tr.Translate("host-node-1")
-		b := tr.Translate("host-node-1")
-		assert.Equal(t, a, b)
-	})
-
-	t.Run("different inputs produce different names", func(t *testing.T) {
-		a := tr.Translate("host-node-1")
-		b := tr.Translate("host-node-2")
-		assert.Assert(t, a != b)
-	})
-
-	t.Run("reverse lookup", func(t *testing.T) {
-		hash := tr.Translate("host-node-1")
-		real, ok := tr.VirtualToReal(hash)
-		assert.Assert(t, ok)
-		assert.Equal(t, real, "host-node-1")
-	})
-
-	t.Run("forward lookup", func(t *testing.T) {
-		virtual, ok := tr.RealToVirtual("host-node-1")
-		assert.Assert(t, ok)
-		assert.Equal(t, virtual, HostNodeHash("host-node-1"))
-	})
-}
-
-func TestNodeNameTranslatorRecovery(t *testing.T) {
-	tr := newNodeNameTranslator()
-
-	tr.RegisterExisting("host-node-1", HostNodeHash("host-node-1"))
-	tr.RegisterExisting("host-node-2", HostNodeHash("host-node-2"))
-
-	// Registered mappings should be retrievable
-	virtual, ok := tr.RealToVirtual("host-node-1")
-	assert.Assert(t, ok)
-	assert.Equal(t, virtual, HostNodeHash("host-node-1"))
-
-	// Translate after recovery should still work
-	name := tr.Translate("host-node-3")
-	assert.Equal(t, name, HostNodeHash("host-node-3"))
-
-	// Duplicate RegisterExisting is a no-op
-	tr.RegisterExisting("host-node-1", "something-else")
-	virtual, _ = tr.RealToVirtual("host-node-1")
-	assert.Equal(t, virtual, HostNodeHash("host-node-1"))
-}
-
-func TestHostNodeHash(t *testing.T) {
-	t.Run("deterministic", func(t *testing.T) {
-		assert.Equal(t, HostNodeHash("host-1"), HostNodeHash("host-1"))
-	})
-	t.Run("12 chars", func(t *testing.T) {
-		assert.Equal(t, len(HostNodeHash("host-1")), 12)
-	})
-	t.Run("different inputs differ", func(t *testing.T) {
-		assert.Assert(t, HostNodeHash("host-1") != HostNodeHash("host-2"))
 	})
 }
