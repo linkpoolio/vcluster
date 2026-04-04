@@ -162,11 +162,22 @@ func (r *fakeNodeSyncer) nodeNeeded(ctx *synccontext.SyncContext, nodeName strin
 		return needed, err
 	}
 
-	// Also check the mapped name: physical pods use host names,
-	// virtual pods use mapped names.
-	virtualName := ResolveVirtualNodeName(nodeName)
+	if !NodeRewriter.Enabled() {
+		return false, nil
+	}
+
+	// Try forward lookup: nodeName might be a host name
+	virtualName := NodeRewriter.Rewrite(nodeName)
 	if virtualName != nodeName {
-		return isNodeNeededByPod(ctx, ctx.VirtualClient, ctx.HostClient, virtualName)
+		needed, err = isNodeNeededByPod(ctx, ctx.VirtualClient, ctx.HostClient, virtualName)
+		if err != nil || needed {
+			return needed, err
+		}
+	}
+
+	// Try reverse lookup: nodeName might be a virtual name
+	if hostName, ok := NodeRewriter.HostName(nodeName); ok {
+		return isNodeNeededByPod(ctx, ctx.VirtualClient, ctx.HostClient, hostName)
 	}
 
 	return false, nil
