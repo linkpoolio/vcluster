@@ -14,6 +14,7 @@ import (
 
 	"github.com/loft-sh/vcluster/pkg/controllers/resources/nodes/nodeservice"
 	podtranslate "github.com/loft-sh/vcluster/pkg/controllers/resources/pods/translate"
+	"github.com/loft-sh/vcluster/pkg/util/nodenamerewriter"
 	"github.com/loft-sh/vcluster/pkg/util/random"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 	corev1 "k8s.io/api/core/v1"
@@ -28,6 +29,10 @@ import (
 var (
 	// FakeNodesVersion is the default version that will be used for fake nodes
 	FakeNodesVersion = "v1.19.1"
+
+	// NodeRewriter is the shared node name rewriter instance used by both the
+	// fake node syncer and the pod syncer. Initialized from env vars at startup.
+	NodeRewriter = nodenamerewriter.DefaultFromEnv()
 )
 
 func NewFakeSyncer(ctx *synccontext.RegisterContext, nodeService nodeservice.Provider) (syncer.Object, error) {
@@ -68,7 +73,7 @@ var _ syncer.FakeSyncer = &fakeNodeSyncer{}
 
 func (r *fakeNodeSyncer) FakeSyncToVirtual(ctx *synccontext.SyncContext, name types.NamespacedName) (ctrl.Result, error) {
 	hostName := name.Name
-	virtualName := resolveVirtualNodeName(ctx, hostName)
+	virtualName := ResolveVirtualNodeName(hostName)
 
 	// The reconciler triggers with the host node name, but the virtual node may
 	// have a different name if a custom node mapper is registered. Check if the
@@ -91,7 +96,7 @@ func (r *fakeNodeSyncer) FakeSyncToVirtual(ctx *synccontext.SyncContext, name ty
 	}
 
 	ctx.Log.Infof("Create fake node %s (host: %s)", virtualName, hostName)
-	return ctrl.Result{}, createFakeNode(ctx, r.fakeKubeletIPs, r.fakeKubeletHostnames, r.nodeServiceProvider, ctx.VirtualClient, virtualName)
+	return ctrl.Result{}, createFakeNode(ctx, r.fakeKubeletIPs, r.fakeKubeletHostnames, r.nodeServiceProvider, ctx.VirtualClient, virtualName, hostName)
 }
 
 func (r *fakeNodeSyncer) FakeSync(ctx *synccontext.SyncContext, vObj client.Object) (ctrl.Result, error) {
@@ -159,7 +164,7 @@ func (r *fakeNodeSyncer) nodeNeeded(ctx *synccontext.SyncContext, nodeName strin
 
 	// Also check the mapped name: physical pods use host names,
 	// virtual pods use mapped names.
-	virtualName := resolveVirtualNodeName(ctx, nodeName)
+	virtualName := ResolveVirtualNodeName(nodeName)
 	if virtualName != nodeName {
 		return isNodeNeededByPod(ctx, ctx.VirtualClient, ctx.HostClient, virtualName)
 	}
@@ -179,21 +184,33 @@ func createFakeNode(
 	nodeServiceProvider nodeservice.Provider,
 	virtualClient client.Client,
 	name string,
+	hostName string,
 ) error {
 	nodeServiceProvider.Lock()
 	defer nodeServiceProvider.Unlock()
 
+	labels := map[string]string{
+		"vcluster.loft.sh/fake-node": "true",
+		"beta.kubernetes.io/arch":    runtime.GOARCH,
+		"beta.kubernetes.io/os":      "linux",
+		"kubernetes.io/arch":         runtime.GOARCH,
+		"kubernetes.io/hostname":     translate.SafeConcatName("fake", name),
+		"kubernetes.io/os":           "linux",
+	}
+
+	if NodeRewriter.Enabled() {
+		if zone := NodeRewriter.Zone(hostName); zone != "" {
+			labels["topology.kubernetes.io/zone"] = zone
+		}
+		if region := NodeRewriter.Region(); region != "" {
+			labels["topology.kubernetes.io/region"] = region
+		}
+	}
+
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-			Labels: map[string]string{
-				"vcluster.loft.sh/fake-node": "true",
-				"beta.kubernetes.io/arch":    runtime.GOARCH,
-				"beta.kubernetes.io/os":      "linux",
-				"kubernetes.io/arch":         runtime.GOARCH,
-				"kubernetes.io/hostname":     translate.SafeConcatName("fake", name),
-				"kubernetes.io/os":           "linux",
-			},
+			Name:   name,
+			Labels: labels,
 			Annotations: map[string]string{
 				"node.alpha.kubernetes.io/ttl":                           "0",
 				"volumes.kubernetes.io/controller-managed-attach-detach": "false",
@@ -314,25 +331,11 @@ func createFakeNode(
 	return nil
 }
 
-// resolveVirtualNodeName translates a host node name to its virtual name using the
-// registered node mapper. If no custom mapper is registered (or it returns the same
-// name), the host name is returned as-is, preserving default behavior.
-func resolveVirtualNodeName(ctx *synccontext.SyncContext, hostName string) string {
-	if ctx.Mappings == nil {
-		return hostName
-	}
-
-	nodeMapper, err := ctx.Mappings.ByGVK(corev1.SchemeGroupVersion.WithKind("Node"))
-	if err != nil {
-		return hostName
-	}
-
-	mapped := nodeMapper.HostToVirtual(ctx, types.NamespacedName{Name: hostName}, nil)
-	if mapped.Name == "" {
-		return hostName
-	}
-
-	return mapped.Name
+// ResolveVirtualNodeName translates a host node name to its virtual name using
+// the shared NodeRewriter. Returns the host name unchanged if no rewriter is
+// configured or the name doesn't match the pattern.
+func ResolveVirtualNodeName(hostName string) string {
+	return NodeRewriter.Rewrite(hostName)
 }
 
 // Filter away  virtual DaemonSet Pods using OwnerReferences to enable scale down
