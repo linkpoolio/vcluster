@@ -2,6 +2,8 @@ package pods
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -537,9 +539,27 @@ func (s *podSyncer) applyResizeSubresource(ctx *synccontext.SyncContext, hostPod
 	return ctx.HostClient.SubResource("resize").Patch(ctx, hostPod, client.RawPatch(types.StrategicMergePatchType, patch))
 }
 
+func hostNodeHash(name string) string {
+	h := sha256.Sum256([]byte(name))
+	return hex.EncodeToString(h[:])[:12]
+}
+
+func (s *podSyncer) resolveVirtualNodeName(ctx *synccontext.SyncContext, hostNodeName string) string {
+	nodeList := &corev1.NodeList{}
+	err := ctx.VirtualClient.List(ctx, nodeList, client.MatchingLabels{
+		"vcluster.loft.sh/host-node-hash": hostNodeHash(hostNodeName),
+	})
+	if err == nil && len(nodeList.Items) > 0 {
+		return nodeList.Items[0].Name
+	}
+
+	return hostNodeName
+}
+
 func (s *podSyncer) ensureNode(ctx *synccontext.SyncContext, pObj *corev1.Pod, vObj *corev1.Pod) (bool, error) {
-	if vObj.Spec.NodeName != pObj.Spec.NodeName && vObj.Spec.NodeName != "" {
-		// node of virtual and physical pod are different, we delete the virtual pod to try to recover from this state
+	virtualNodeName := s.resolveVirtualNodeName(ctx, pObj.Spec.NodeName)
+
+	if vObj.Spec.NodeName != virtualNodeName && vObj.Spec.NodeName != "" {
 		_, err := patcher.DeleteVirtualObject(ctx, vObj, pObj, "virtual and physical pods have different assigned nodes")
 		if err != nil {
 			return false, err
@@ -548,20 +568,18 @@ func (s *podSyncer) ensureNode(ctx *synccontext.SyncContext, pObj *corev1.Pod, v
 		return true, nil
 	}
 
-	// ensure the node is available in the virtual cluster, if not and we sync the pod to the virtual cluster,
-	// it will get deleted automatically by kubernetes so we ensure the node is synced
 	vNode := &corev1.Node{}
-	err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: pObj.Spec.NodeName}, vNode)
+	err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: virtualNodeName}, vNode)
 	if err != nil {
 		if !kerrors.IsNotFound(err) {
-			ctx.Log.Infof("error retrieving virtual node %s: %v", pObj.Spec.NodeName, err)
+			ctx.Log.Infof("error retrieving virtual node %s: %v", virtualNodeName, err)
 			return false, err
 		}
 
 		return true, nil
 	}
 
-	if vObj.Spec.NodeName != pObj.Spec.NodeName {
+	if vObj.Spec.NodeName != virtualNodeName {
 		err = s.assignNodeToPod(ctx, pObj, vObj)
 		if err != nil {
 			return false, err
@@ -574,7 +592,8 @@ func (s *podSyncer) ensureNode(ctx *synccontext.SyncContext, pObj *corev1.Pod, v
 }
 
 func (s *podSyncer) assignNodeToPod(ctx *synccontext.SyncContext, pObj *corev1.Pod, vObj *corev1.Pod) error {
-	ctx.Log.Infof("bind virtual pod %s/%s to node %s, because node name between physical and virtual is different", vObj.Namespace, vObj.Name, pObj.Spec.NodeName)
+	virtualNodeName := s.resolveVirtualNodeName(ctx, pObj.Spec.NodeName)
+	ctx.Log.Infof("bind virtual pod %s/%s to node %s", vObj.Namespace, vObj.Name, virtualNodeName)
 	err := s.virtualClusterClient.CoreV1().Pods(vObj.Namespace).Bind(ctx, &corev1.Binding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      vObj.Name,
@@ -582,7 +601,7 @@ func (s *podSyncer) assignNodeToPod(ctx *synccontext.SyncContext, pObj *corev1.P
 		},
 		Target: corev1.ObjectReference{
 			Kind:       "Node",
-			Name:       pObj.Spec.NodeName,
+			Name:       virtualNodeName,
 			APIVersion: "v1",
 		},
 	}, metav1.CreateOptions{})
