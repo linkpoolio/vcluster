@@ -278,6 +278,14 @@ func (m *Manager) MutateObject(ctx context.Context, obj client.Object, hookType 
 		}
 	}
 
+	// Reset the object before unmarshaling so that fields removed by the
+	// plugin hook (e.g. labels, annotations) are actually cleared. Without
+	// this, omitempty JSON tags cause removed map entries to survive the
+	// round-trip because Unmarshal skips absent fields.
+	if clientObj, ok := obj.(client.Object); ok {
+		clientObj.SetLabels(nil)
+		clientObj.SetAnnotations(nil)
+	}
 	err = json.Unmarshal(encodedObj, obj)
 	if err != nil {
 		return fmt.Errorf("decode object: %w", err)
