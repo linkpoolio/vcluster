@@ -7,9 +7,11 @@ import (
 	"strings"
 
 	"github.com/loft-sh/vcluster/pkg/constants"
+	"github.com/loft-sh/vcluster/pkg/mappings"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	syncer "github.com/loft-sh/vcluster/pkg/syncer/types"
 	"k8s.io/apimachinery/pkg/api/equality"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/loft-sh/vcluster/pkg/controllers/resources/nodes/nodeservice"
 	podtranslate "github.com/loft-sh/vcluster/pkg/controllers/resources/pods/translate"
@@ -66,15 +68,31 @@ func (r *fakeNodeSyncer) ModifyController(ctx *synccontext.RegisterContext, buil
 var _ syncer.FakeSyncer = &fakeNodeSyncer{}
 
 func (r *fakeNodeSyncer) FakeSyncToVirtual(ctx *synccontext.SyncContext, name types.NamespacedName) (ctrl.Result, error) {
-	needed, err := r.nodeNeeded(ctx, name.Name)
+	hostName := name.Name
+	virtualName := resolveVirtualNodeName(ctx, hostName)
+
+	// The reconciler triggers with the host node name, but the virtual node may
+	// have a different name if a plugin hook renamed it. Check if the virtual
+	// node already exists under the mapped name.
+	if virtualName != hostName {
+		vNode := &corev1.Node{}
+		err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: virtualName}, vNode)
+		if err == nil {
+			return r.FakeSync(ctx, vNode)
+		} else if !kerrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+	}
+
+	needed, err := r.nodeNeeded(ctx, hostName)
 	if err != nil {
 		return ctrl.Result{}, err
 	} else if !needed {
 		return ctrl.Result{}, nil
 	}
 
-	ctx.Log.Infof("Create fake node %s", name.Name)
-	return ctrl.Result{}, createFakeNode(ctx, r.fakeKubeletIPs, r.fakeKubeletHostnames, r.nodeServiceProvider, ctx.VirtualClient, name.Name)
+	ctx.Log.Infof("Create fake node %s (host: %s)", virtualName, hostName)
+	return ctrl.Result{}, createFakeNode(ctx, r.fakeKubeletIPs, r.fakeKubeletHostnames, r.nodeServiceProvider, ctx.VirtualClient, virtualName)
 }
 
 func (r *fakeNodeSyncer) FakeSync(ctx *synccontext.SyncContext, vObj client.Object) (ctrl.Result, error) {
@@ -135,7 +153,32 @@ func (r *fakeNodeSyncer) updateIfNeeded(ctx *synccontext.SyncContext, node *core
 }
 
 func (r *fakeNodeSyncer) nodeNeeded(ctx *synccontext.SyncContext, nodeName string) (bool, error) {
-	return isNodeNeededByPod(ctx, ctx.VirtualClient, ctx.HostClient, nodeName)
+	needed, err := isNodeNeededByPod(ctx, ctx.VirtualClient, ctx.HostClient, nodeName)
+	if err != nil || needed {
+		return needed, err
+	}
+
+	nodeMapper, err := ctx.Mappings.ByGVK(mappings.Nodes())
+	if err != nil {
+		return false, nil
+	}
+
+	// Try as host name -> resolve to virtual name
+	virtualName := nodeMapper.HostToVirtual(ctx, types.NamespacedName{Name: nodeName}, nil).Name
+	if virtualName != "" && virtualName != nodeName {
+		needed, err = isNodeNeededByPod(ctx, ctx.VirtualClient, ctx.HostClient, virtualName)
+		if err != nil || needed {
+			return needed, err
+		}
+	}
+
+	// Try as virtual name -> resolve to host name
+	hostName := nodeMapper.VirtualToHost(ctx, types.NamespacedName{Name: nodeName}, nil).Name
+	if hostName != "" && hostName != nodeName {
+		return isNodeNeededByPod(ctx, ctx.VirtualClient, ctx.HostClient, hostName)
+	}
+
+	return false, nil
 }
 
 // this is not a real guid, but it doesn't really matter because it should just look right and not be an actual guid
@@ -319,6 +362,21 @@ func filterOutPhysicalDaemonSets(pl *corev1.PodList) []corev1.Pod {
 		}
 	}
 	return podsNoDaemonSets
+}
+
+// resolveVirtualNodeName translates a host node name to its virtual name using
+// the node mapper from the mappings registry. Returns the host name unchanged
+// if no custom mapping exists.
+func resolveVirtualNodeName(ctx *synccontext.SyncContext, hostName string) string {
+	nodeMapper, err := ctx.Mappings.ByGVK(mappings.Nodes())
+	if err != nil {
+		return hostName
+	}
+	mapped := nodeMapper.HostToVirtual(ctx, types.NamespacedName{Name: hostName}, nil)
+	if mapped.Name == "" {
+		return hostName
+	}
+	return mapped.Name
 }
 
 func GetNodeHost(nodeName string) string {
