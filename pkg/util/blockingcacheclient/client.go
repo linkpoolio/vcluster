@@ -215,11 +215,13 @@ func (c *CacheClient) newEmptyObjectFor(from client.Object) (client.Object, erro
 	return created.(client.Object), nil
 }
 
-// blockApply waits until the applied object is visible in the cache.
+// blockApply waits until the applied object appears in the cache with the expected state.
 // clientObj must be non-nil (caller must have extracted it from the ApplyConfiguration).
-// Apply() has already succeeded against the API. A no-op SSA leaves
-// resourceVersion unchanged; requiring a newer RV timed out after 2s and
-// crashed the vcluster leader (metrics-server VAP re-apply on every lease).
+// preApplyMeta is the object's metadata from a GET before Apply; if nil (e.g. object did not exist),
+// we consider the cache updated once the object exists. Otherwise we wait until
+// UID/Generation/ResourceVersion differ so the cache has observed the Apply.
+// A no-op SSA leaves those unchanged, so the wait times out; if the object still
+// exists, Apply() already succeeded and we treat that as synced.
 func (c *CacheClient) blockApply(ctx context.Context, obj runtime.ApplyConfiguration, clientObj client.Object, preApplyMeta metav1.Object) error {
 	nn := types.NamespacedName{Namespace: clientObj.GetNamespace(), Name: clientObj.GetName()}
 	newObj, err := c.newEmptyObjectFor(clientObj)
@@ -227,7 +229,7 @@ func (c *CacheClient) blockApply(ctx context.Context, obj runtime.ApplyConfigura
 		return err
 	}
 
-	return wait.PollUntilContextTimeout(ctx, time.Millisecond*10, time.Second*2, true, func(context.Context) (bool, error) {
+	err = wait.PollUntilContextTimeout(ctx, time.Millisecond*10, time.Second*2, true, func(context.Context) (bool, error) {
 		err := c.Client.Get(ctx, nn, newObj)
 		if err != nil {
 			if runtime.IsNotRegisteredError(err) {
@@ -243,9 +245,27 @@ func (c *CacheClient) blockApply(ctx context.Context, obj runtime.ApplyConfigura
 			return false, nil
 		}
 
-		// Visible in cache. That is enough for create, update, and no-op SSA.
-		return true, nil
+		if preApplyMeta == nil {
+			// Object did not exist before Apply; it now exists in cache.
+			return true, nil
+		}
+
+		newAccessor, err := meta.Accessor(newObj)
+		if err != nil {
+			return false, err
+		}
+		// Cache has applied state when UID/Generation/ResourceVersion changed from pre-apply.
+		return preApplyMeta.GetUID() != newAccessor.GetUID() ||
+			newAccessor.GetGeneration() > preApplyMeta.GetGeneration() ||
+			newAccessor.GetResourceVersion() != preApplyMeta.GetResourceVersion(), nil
 	})
+	if err == nil {
+		return nil
+	}
+	if getErr := c.Client.Get(ctx, nn, newObj); getErr == nil {
+		return nil
+	}
+	return err
 }
 
 // TODO: implement DeleteAllOf
