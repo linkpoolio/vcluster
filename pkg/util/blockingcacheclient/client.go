@@ -215,11 +215,11 @@ func (c *CacheClient) newEmptyObjectFor(from client.Object) (client.Object, erro
 	return created.(client.Object), nil
 }
 
-// blockApply waits until the applied object appears in the cache with the expected state.
+// blockApply waits until the applied object is visible in the cache.
 // clientObj must be non-nil (caller must have extracted it from the ApplyConfiguration).
-// preApplyMeta is the object's metadata from a GET before Apply; if nil (e.g. object did not exist),
-// we consider the cache updated once the object exists. Otherwise we compare until UID/Generation/ResourceVersion
-// differ so the cache has observed the Apply.
+// Apply() has already succeeded against the API. A no-op SSA leaves
+// resourceVersion unchanged; requiring a newer RV timed out after 2s and
+// crashed the vcluster leader (metrics-server VAP re-apply on every lease).
 func (c *CacheClient) blockApply(ctx context.Context, obj runtime.ApplyConfiguration, clientObj client.Object, preApplyMeta metav1.Object) error {
 	nn := types.NamespacedName{Namespace: clientObj.GetNamespace(), Name: clientObj.GetName()}
 	newObj, err := c.newEmptyObjectFor(clientObj)
@@ -243,23 +243,8 @@ func (c *CacheClient) blockApply(ctx context.Context, obj runtime.ApplyConfigura
 			return false, nil
 		}
 
-		if preApplyMeta == nil {
-			// Object did not exist before Apply; it now exists in cache.
-			return true, nil
-		}
-
-		newAccessor, err := meta.Accessor(newObj)
-		if err != nil {
-			return false, err
-		}
-		// Cache has applied state when UID/Generation/ResourceVersion changed from pre-apply.
-		// Condition 1: UID changed - object was deleted and recreated
-		// Condition 2: Generation increased - spec was updated
-		// Condition 3: ResourceVersion changed - any update occurred (metadata, spec, or status)
-		// If any of these conditions are true, the Apply operation is reflected in the cache.
-		return preApplyMeta.GetUID() != newAccessor.GetUID() ||
-			newAccessor.GetGeneration() > preApplyMeta.GetGeneration() ||
-			newAccessor.GetResourceVersion() != preApplyMeta.GetResourceVersion(), nil
+		// Visible in cache. That is enough for create, update, and no-op SSA.
+		return true, nil
 	})
 }
 
