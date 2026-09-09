@@ -218,8 +218,10 @@ func (c *CacheClient) newEmptyObjectFor(from client.Object) (client.Object, erro
 // blockApply waits until the applied object appears in the cache with the expected state.
 // clientObj must be non-nil (caller must have extracted it from the ApplyConfiguration).
 // preApplyMeta is the object's metadata from a GET before Apply; if nil (e.g. object did not exist),
-// we consider the cache updated once the object exists. Otherwise we compare until UID/Generation/ResourceVersion
-// differ so the cache has observed the Apply.
+// we consider the cache updated once the object exists. Otherwise we wait until
+// UID/Generation/ResourceVersion differ so the cache has observed the Apply.
+// A no-op SSA leaves those unchanged, so the wait times out; if the object still
+// exists, Apply() already succeeded and we treat that as synced.
 func (c *CacheClient) blockApply(ctx context.Context, obj runtime.ApplyConfiguration, clientObj client.Object, preApplyMeta metav1.Object) error {
 	nn := types.NamespacedName{Namespace: clientObj.GetNamespace(), Name: clientObj.GetName()}
 	newObj, err := c.newEmptyObjectFor(clientObj)
@@ -227,7 +229,7 @@ func (c *CacheClient) blockApply(ctx context.Context, obj runtime.ApplyConfigura
 		return err
 	}
 
-	return wait.PollUntilContextTimeout(ctx, time.Millisecond*10, time.Second*2, true, func(context.Context) (bool, error) {
+	err = wait.PollUntilContextTimeout(ctx, time.Millisecond*10, time.Second*2, true, func(context.Context) (bool, error) {
 		err := c.Client.Get(ctx, nn, newObj)
 		if err != nil {
 			if runtime.IsNotRegisteredError(err) {
@@ -253,14 +255,17 @@ func (c *CacheClient) blockApply(ctx context.Context, obj runtime.ApplyConfigura
 			return false, err
 		}
 		// Cache has applied state when UID/Generation/ResourceVersion changed from pre-apply.
-		// Condition 1: UID changed - object was deleted and recreated
-		// Condition 2: Generation increased - spec was updated
-		// Condition 3: ResourceVersion changed - any update occurred (metadata, spec, or status)
-		// If any of these conditions are true, the Apply operation is reflected in the cache.
 		return preApplyMeta.GetUID() != newAccessor.GetUID() ||
 			newAccessor.GetGeneration() > preApplyMeta.GetGeneration() ||
 			newAccessor.GetResourceVersion() != preApplyMeta.GetResourceVersion(), nil
 	})
+	if err == nil {
+		return nil
+	}
+	if getErr := c.Client.Get(ctx, nn, newObj); getErr == nil {
+		return nil
+	}
+	return err
 }
 
 // TODO: implement DeleteAllOf
