@@ -78,7 +78,17 @@ func TestMapperMappingsOnly(t *testing.T) {
 	assert.Equal(t, translate.Default.HostNamespace(syncCtx, "kube-system"), "")
 	assert.DeepEqual(t, translate.Default.HostName(syncCtx, "nginx", "kube-system"), types.NamespacedName{})
 	assert.DeepEqual(t, translate.Default.HostNameShort(syncCtx, "nginx", "kube-system"), types.NamespacedName{})
-	assert.Assert(t, translate.Default.IsTargetedNamespace(syncCtx, "tenant-cp"))
+
+	// the control plane namespace is no longer a sync target, so stale single-namespace mappings and objects
+	// there are ignored
+	assert.Assert(t, !translate.Default.IsTargetedNamespace(syncCtx, "tenant-cp"))
+	assert.Assert(t, translate.Default.IsTargetedNamespace(syncCtx, "tenant-team-dev"))
+	stale := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: "coredns-x-kube-system-x-tenant", Namespace: "tenant-cp",
+		Labels:      map[string]string{translate.MarkerLabel: "tenant"},
+		Annotations: map[string]string{translate.NameAnnotation: "coredns", translate.NamespaceAnnotation: "kube-system"},
+	}}
+	assert.Assert(t, !translate.Default.IsManaged(syncCtx, stale))
 }
 
 func TestMapperHostToVirtual(t *testing.T) {

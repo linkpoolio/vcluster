@@ -102,22 +102,31 @@ func (s *SyncedNamespaces) HostNamespace(ctx *synccontext.SyncContext, vNamespac
 	return s.single.HostNamespace(ctx, vNamespace)
 }
 
+// IsTargetedNamespace reports whether synced objects may live in pNamespace. With mappingsOnly the control plane
+// namespace is not a target: nothing tenant-side belongs there, and rejecting it lets the mapping store drop
+// mappings recorded before namespace sync was switched on, so those objects re-translate into their mapped
+// namespace on the next leader start.
 func (s *SyncedNamespaces) IsTargetedNamespace(_ *synccontext.SyncContext, pNamespace string) bool {
 	if pNamespace == s.hostNamespace {
-		return true
+		return !s.mappingsOnly.Load()
 	}
 	_, ok := s.mappedVirtualNamespace(pNamespace)
 	return ok
 }
 
 func (s *SyncedNamespaces) IsManaged(ctx *synccontext.SyncContext, pObj client.Object) bool {
-	// cluster scoped objects and objects in the control plane namespace follow single-namespace rules
-	if pObj.GetNamespace() == "" || pObj.GetNamespace() == s.hostNamespace {
+	// cluster scoped objects follow single-namespace rules
+	if pObj.GetNamespace() == "" {
 		return s.single.IsManaged(ctx, pObj)
 	}
 
 	if !s.IsTargetedNamespace(ctx, pObj.GetNamespace()) {
 		return false
+	}
+
+	// objects in the control plane namespace follow single-namespace rules
+	if pObj.GetNamespace() == s.hostNamespace {
+		return s.single.IsManaged(ctx, pObj)
 	}
 
 	// objects in mapped namespaces keep their names, so only the annotations tell us if we created them
