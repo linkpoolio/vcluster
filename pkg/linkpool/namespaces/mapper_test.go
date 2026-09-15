@@ -19,7 +19,7 @@ import (
 
 // newMapperForTest goes through resources.CreateNamespacesMapper so the pro hook override registered in init() is
 // exercised as well.
-func newMapperForTest(t *testing.T) (*synccontext.SyncContext, synccontext.Mapper) {
+func newMapperForTest(t *testing.T, mappingsOnly bool) (*synccontext.SyncContext, synccontext.Mapper) {
 	storeBackend := store.NewMemoryBackend()
 	mappingsStore, err := store.NewStore(context.TODO(), nil, nil, storeBackend)
 	assert.NilError(t, err)
@@ -28,6 +28,7 @@ func newMapperForTest(t *testing.T) (*synccontext.SyncContext, synccontext.Mappe
 	vConfig.Name = "tenant"
 	vConfig.HostNamespace = "tenant-cp"
 	vConfig.Sync.ToHost.Namespaces.Enabled = true
+	vConfig.Sync.ToHost.Namespaces.MappingsOnly = mappingsOnly
 	vConfig.Sync.ToHost.Namespaces.Mappings.ByName = map[string]string{
 		"frontend": "customer-frontend",
 		"team-*":   "${name}-team-*",
@@ -36,7 +37,10 @@ func newMapperForTest(t *testing.T) (*synccontext.SyncContext, synccontext.Mappe
 	oldName, oldDefault := translate.VClusterName, translate.Default
 	t.Cleanup(func() { translate.VClusterName, translate.Default = oldName, oldDefault })
 	translate.VClusterName = "tenant"
-	translate.Default = NewTranslator("tenant-cp", vConfig.Sync.ToHost.Namespaces.Mappings.ByName)
+	oldCurrent := current
+	t.Cleanup(func() { current = oldCurrent })
+	current = NewTranslator("tenant-cp", vConfig.Sync.ToHost.Namespaces.Mappings.ByName)
+	translate.Default = current
 
 	mappingsRegistry := mappings.NewMappingsRegistry(mappingsStore)
 	registerContext := &synccontext.RegisterContext{
@@ -55,16 +59,30 @@ func newMapperForTest(t *testing.T) (*synccontext.SyncContext, synccontext.Mappe
 }
 
 func TestMapperVirtualToHost(t *testing.T) {
-	syncCtx, m := newMapperForTest(t)
+	syncCtx, m := newMapperForTest(t, false)
 	assert.DeepEqual(t, m.VirtualToHost(syncCtx, types.NamespacedName{Name: "frontend"}, nil), types.NamespacedName{Name: "customer-frontend"})
 	assert.DeepEqual(t, m.VirtualToHost(syncCtx, types.NamespacedName{Name: "team-dev"}, nil), types.NamespacedName{Name: "tenant-team-dev"})
 	// unmapped namespaces resolve to the control plane namespace so lookups like the DNS service work
 	assert.DeepEqual(t, m.VirtualToHost(syncCtx, types.NamespacedName{Name: "kube-system"}, nil), types.NamespacedName{Name: "tenant-cp"})
 	assert.DeepEqual(t, m.VirtualToHost(syncCtx, types.NamespacedName{Name: ""}, nil), types.NamespacedName{})
+	assert.Equal(t, translate.Default.HostNamespace(syncCtx, "kube-system"), "tenant-cp")
+}
+
+func TestMapperMappingsOnly(t *testing.T) {
+	syncCtx, m := newMapperForTest(t, true)
+	assert.DeepEqual(t, m.VirtualToHost(syncCtx, types.NamespacedName{Name: "team-dev"}, nil), types.NamespacedName{Name: "tenant-team-dev"})
+	assert.DeepEqual(t, m.VirtualToHost(syncCtx, types.NamespacedName{Name: "kube-system"}, nil), types.NamespacedName{})
+
+	// the mapper hands mappingsOnly to the translator built by the pro hook
+	assert.Equal(t, translate.Default.HostNamespace(syncCtx, "team-dev"), "tenant-team-dev")
+	assert.Equal(t, translate.Default.HostNamespace(syncCtx, "kube-system"), "")
+	assert.DeepEqual(t, translate.Default.HostName(syncCtx, "nginx", "kube-system"), types.NamespacedName{})
+	assert.DeepEqual(t, translate.Default.HostNameShort(syncCtx, "nginx", "kube-system"), types.NamespacedName{})
+	assert.Assert(t, translate.Default.IsTargetedNamespace(syncCtx, "tenant-cp"))
 }
 
 func TestMapperHostToVirtual(t *testing.T) {
-	syncCtx, m := newMapperForTest(t)
+	syncCtx, m := newMapperForTest(t, false)
 	assert.DeepEqual(t, m.HostToVirtual(syncCtx, types.NamespacedName{Name: "customer-frontend"}, nil), types.NamespacedName{Name: "frontend"})
 	assert.DeepEqual(t, m.HostToVirtual(syncCtx, types.NamespacedName{Name: "tenant-team-dev"}, nil), types.NamespacedName{Name: "team-dev"})
 	assert.DeepEqual(t, m.HostToVirtual(syncCtx, types.NamespacedName{Name: "tenant-cp"}, nil), types.NamespacedName{})
@@ -72,7 +90,7 @@ func TestMapperHostToVirtual(t *testing.T) {
 }
 
 func TestMapperIsManaged(t *testing.T) {
-	syncCtx, m := newMapperForTest(t)
+	syncCtx, m := newMapperForTest(t, false)
 
 	check := func(ns *corev1.Namespace) bool {
 		managed, err := m.IsManaged(syncCtx, ns)

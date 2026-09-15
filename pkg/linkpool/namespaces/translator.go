@@ -1,6 +1,8 @@
 package namespaces
 
 import (
+	"sync/atomic"
+
 	"github.com/loft-sh/vcluster/pkg/scheme"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
@@ -9,80 +11,98 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 )
 
-var _ translate.Translator = &syncedNamespaces{}
+var _ translate.Translator = &SyncedNamespaces{}
 
 // NewTranslator returns a translator for sync.toHost.namespaces. Virtual namespaces matched by mappings are synced
 // to their own host namespace and keep their object names. Unmapped virtual namespaces fall back to
-// single-namespace behaviour, i.e. rewritten names inside hostNamespace.
-func NewTranslator(hostNamespace string, mappings map[string]string) translate.Translator {
-	return &syncedNamespaces{
+// single-namespace behaviour, i.e. rewritten names inside hostNamespace, unless mappingsOnly is set, in which case
+// their objects get no host name and are not synced.
+func NewTranslator(hostNamespace string, mappings map[string]string) *SyncedNamespaces {
+	return &SyncedNamespaces{
 		hostNamespace: hostNamespace,
 		mappings:      mappings,
 		single:        translate.NewSingleNamespaceTranslator(hostNamespace),
 	}
 }
 
-type syncedNamespaces struct {
+type SyncedNamespaces struct {
 	hostNamespace string
 	mappings      map[string]string
+	mappingsOnly  atomic.Bool
 
 	single translate.Translator
 }
 
-func (s *syncedNamespaces) SingleNamespaceTarget() bool {
+// SetMappingsOnly switches unmapped virtual namespaces from the control plane namespace fallback to not being
+// synced at all. The pro hook that builds the translator does not receive this flag, so the mapper sets it from
+// the full config before any controller starts.
+func (s *SyncedNamespaces) SetMappingsOnly(mappingsOnly bool) {
+	s.mappingsOnly.Store(mappingsOnly)
+}
+
+func (s *SyncedNamespaces) SingleNamespaceTarget() bool {
 	return false
 }
 
-func (s *syncedNamespaces) mappedHostNamespace(vNamespace string) (string, bool) {
+func (s *SyncedNamespaces) mappedHostNamespace(vNamespace string) (string, bool) {
 	return TranslateVirtualNamespace(translate.VClusterName, vNamespace, s.mappings)
 }
 
-func (s *syncedNamespaces) mappedVirtualNamespace(pNamespace string) (string, bool) {
+func (s *SyncedNamespaces) mappedVirtualNamespace(pNamespace string) (string, bool) {
 	if pNamespace == s.hostNamespace {
 		return "", false
 	}
 	return TranslateHostNamespace(translate.VClusterName, pNamespace, s.mappings)
 }
 
-func (s *syncedNamespaces) HostName(ctx *synccontext.SyncContext, vName, vNamespace string) types.NamespacedName {
+func (s *SyncedNamespaces) HostName(ctx *synccontext.SyncContext, vName, vNamespace string) types.NamespacedName {
 	if vName == "" {
 		return types.NamespacedName{}
 	}
 	if pNamespace, ok := s.mappedHostNamespace(vNamespace); ok {
 		return types.NamespacedName{Name: vName, Namespace: pNamespace}
+	}
+	if s.mappingsOnly.Load() {
+		return types.NamespacedName{}
 	}
 	return s.single.HostName(ctx, vName, vNamespace)
 }
 
-func (s *syncedNamespaces) HostNameShort(ctx *synccontext.SyncContext, vName, vNamespace string) types.NamespacedName {
+func (s *SyncedNamespaces) HostNameShort(ctx *synccontext.SyncContext, vName, vNamespace string) types.NamespacedName {
 	if vName == "" {
 		return types.NamespacedName{}
 	}
 	if pNamespace, ok := s.mappedHostNamespace(vNamespace); ok {
 		return types.NamespacedName{Name: vName, Namespace: pNamespace}
 	}
+	if s.mappingsOnly.Load() {
+		return types.NamespacedName{}
+	}
 	return s.single.HostNameShort(ctx, vName, vNamespace)
 }
 
-func (s *syncedNamespaces) HostNameCluster(vName string) string {
+func (s *SyncedNamespaces) HostNameCluster(vName string) string {
 	return s.single.HostNameCluster(vName)
 }
 
-func (s *syncedNamespaces) MarkerLabelCluster() string {
+func (s *SyncedNamespaces) MarkerLabelCluster() string {
 	return s.single.MarkerLabelCluster()
 }
 
-func (s *syncedNamespaces) HostNamespace(ctx *synccontext.SyncContext, vNamespace string) string {
+func (s *SyncedNamespaces) HostNamespace(ctx *synccontext.SyncContext, vNamespace string) string {
 	if vNamespace == "" {
 		return ""
 	}
 	if pNamespace, ok := s.mappedHostNamespace(vNamespace); ok {
 		return pNamespace
 	}
+	if s.mappingsOnly.Load() {
+		return ""
+	}
 	return s.single.HostNamespace(ctx, vNamespace)
 }
 
-func (s *syncedNamespaces) IsTargetedNamespace(_ *synccontext.SyncContext, pNamespace string) bool {
+func (s *SyncedNamespaces) IsTargetedNamespace(_ *synccontext.SyncContext, pNamespace string) bool {
 	if pNamespace == s.hostNamespace {
 		return true
 	}
@@ -90,7 +110,7 @@ func (s *syncedNamespaces) IsTargetedNamespace(_ *synccontext.SyncContext, pName
 	return ok
 }
 
-func (s *syncedNamespaces) IsManaged(ctx *synccontext.SyncContext, pObj client.Object) bool {
+func (s *SyncedNamespaces) IsManaged(ctx *synccontext.SyncContext, pObj client.Object) bool {
 	// cluster scoped objects and objects in the control plane namespace follow single-namespace rules
 	if pObj.GetNamespace() == "" || pObj.GetNamespace() == s.hostNamespace {
 		return s.single.IsManaged(ctx, pObj)
@@ -124,6 +144,6 @@ func (s *syncedNamespaces) IsManaged(ctx *synccontext.SyncContext, pObj client.O
 	return true
 }
 
-func (s *syncedNamespaces) LabelsToTranslate() map[string]bool {
+func (s *SyncedNamespaces) LabelsToTranslate() map[string]bool {
 	return s.single.LabelsToTranslate()
 }

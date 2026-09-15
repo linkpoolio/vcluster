@@ -1,6 +1,8 @@
 package namespaces
 
 import (
+	"sync"
+
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 	corev1 "k8s.io/api/core/v1"
@@ -12,21 +14,27 @@ import (
 
 // NewMapper maps virtual namespaces to host namespaces through sync.toHost.namespaces.mappings. Unmapped virtual
 // namespaces resolve to the control plane namespace, where their objects live with rewritten names; the namespace
-// syncer skips those. The mapper is deterministic, so it is deliberately not wrapped in the store recorder.
+// syncer skips those. With mappingsOnly they resolve to nothing and are not synced at all. The mapper is
+// deterministic, so it is deliberately not wrapped in the store recorder.
 func NewMapper(ctx *synccontext.RegisterContext) synccontext.Mapper {
-	if ctx.Config.Sync.ToHost.Namespaces.MappingsOnly {
-		klog.Warning("sync.toHost.namespaces.mappingsOnly is not enforced by this build; unmapped virtual namespaces sync into the control plane namespace")
+	mappingsOnly := ctx.Config.Sync.ToHost.Namespaces.MappingsOnly
+	if current != nil {
+		current.SetMappingsOnly(mappingsOnly)
 	}
 
 	return &mapper{
 		hostNamespace: ctx.Config.HostNamespace,
 		mappings:      ctx.Config.Sync.ToHost.Namespaces.Mappings.ByName,
+		mappingsOnly:  mappingsOnly,
 	}
 }
 
 type mapper struct {
 	hostNamespace string
 	mappings      map[string]string
+	mappingsOnly  bool
+
+	warned sync.Map
 }
 
 func (m *mapper) Migrate(_ *synccontext.RegisterContext, _ synccontext.Mapper) error {
@@ -37,17 +45,23 @@ func (m *mapper) GroupVersionKind() schema.GroupVersionKind {
 	return corev1.SchemeGroupVersion.WithKind("Namespace")
 }
 
-func (m *mapper) VirtualToHost(_ *synccontext.SyncContext, req types.NamespacedName, _ client.Object) types.NamespacedName {
+func (m *mapper) VirtualToHost(ctx *synccontext.SyncContext, req types.NamespacedName, _ client.Object) types.NamespacedName {
 	if req.Name == "" {
 		return types.NamespacedName{}
 	}
 
 	pNamespace, ok := TranslateVirtualNamespace(translate.VClusterName, req.Name, m.mappings)
-	if !ok {
+	if ok {
+		return types.NamespacedName{Name: pNamespace}
+	}
+	if !m.mappingsOnly {
 		return types.NamespacedName{Name: m.hostNamespace}
 	}
 
-	return types.NamespacedName{Name: pNamespace}
+	if _, seen := m.warned.LoadOrStore(req.Name, true); !seen {
+		klog.FromContext(ctx).Info("Virtual namespace is not allowed by sync.toHost.namespaces.mappings and will not be synced", "namespace", req.Name)
+	}
+	return types.NamespacedName{}
 }
 
 func (m *mapper) HostToVirtual(_ *synccontext.SyncContext, req types.NamespacedName, _ client.Object) types.NamespacedName {
