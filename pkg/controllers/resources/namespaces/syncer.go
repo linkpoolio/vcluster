@@ -14,6 +14,7 @@ import (
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -46,7 +47,9 @@ func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
 		Importer:                   pro.NewImporter(mapper),
 		excludedAnnotations:        excludedAnnotations,
 
-		namespaceLabels: namespaceLabels,
+		namespaceLabels:  namespaceLabels,
+		currentNamespace: ctx.CurrentNamespace,
+		syncContext:      ctx.ToSyncContext("namespace-syncer"),
 	}, nil
 }
 
@@ -57,10 +60,42 @@ type namespaceSyncer struct {
 	namespaceLabels            map[string]string
 	workloadServiceAccountName string
 	excludedAnnotations        []string
+
+	currentNamespace string
+	syncContext      *synccontext.SyncContext
 }
 
 var _ syncertypes.Syncer = &namespaceSyncer{}
 var _ syncertypes.OptionsProvider = &namespaceSyncer{}
+var _ syncertypes.ObjectExcluder = &namespaceSyncer{}
+
+// ExcludeVirtual skips virtual namespaces that resolve to the vCluster's own host namespace. Those are not
+// synced as namespaces; their objects live in the host namespace with rewritten names.
+func (s *namespaceSyncer) ExcludeVirtual(vObj client.Object) bool {
+	if s.excludedByController(vObj) {
+		return true
+	}
+
+	return s.VirtualToHost(s.syncContext, types.NamespacedName{Name: vObj.GetName()}, vObj).Name == s.currentNamespace
+}
+
+// ExcludePhysical never lets the syncer touch the vCluster's own host namespace.
+func (s *namespaceSyncer) ExcludePhysical(pObj client.Object) bool {
+	if s.excludedByController(pObj) {
+		return true
+	}
+
+	return pObj.GetName() == s.currentNamespace
+}
+
+func (s *namespaceSyncer) excludedByController(obj client.Object) bool {
+	if obj.GetLabels()[translate.ControllerLabel] != "" {
+		return true
+	}
+
+	controller := obj.GetAnnotations()[translate.ControllerLabel]
+	return controller != "" && controller != s.Name()
+}
 
 func (s *namespaceSyncer) Options() *syncertypes.Options {
 	return &syncertypes.Options{
@@ -100,6 +135,14 @@ func (s *namespaceSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.
 			retErr = utilerrors.NewAggregate([]error{retErr, err})
 		}
 	}()
+
+	// a host namespace we did not create is adopted as imported so deleting the virtual namespace never removes it
+	if event.Host.Annotations[translate.NameAnnotation] == "" && event.Host.Annotations[translate.ImportedMarkerAnnotation] != "true" {
+		if event.Host.Annotations == nil {
+			event.Host.Annotations = map[string]string{}
+		}
+		event.Host.Annotations[translate.ImportedMarkerAnnotation] = "true"
+	}
 
 	s.translateUpdate(event.Host, event.Virtual)
 	return ctrl.Result{}, s.EnsureWorkloadServiceAccount(ctx, event.Host.Name)

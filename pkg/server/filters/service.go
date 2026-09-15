@@ -1,9 +1,12 @@
 package filters
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"net/http"
+	"time"
 
 	"github.com/loft-sh/vcluster/pkg/controllers/resources/services"
 	"github.com/loft-sh/vcluster/pkg/mappings"
@@ -217,6 +220,17 @@ func createService(ctx *synccontext.SyncContext, req *http.Request, decoder enco
 	newService.Annotations[services.ServiceBlockDeletion] = "true"
 	newService.Spec.Selector = translate.HostLabelsMap(vService.Spec.Selector, nil, vService.Namespace, false)
 	err = ctx.HostClient.Create(req.Context(), newService)
+	if kerrors.IsNotFound(err) && ctx.Config.Sync.ToHost.Namespaces.Enabled {
+		// the host namespace is created asynchronously by the namespace syncer, so a service created right after
+		// its namespace can race it; wait briefly for the namespace to show up
+		err = wait.PollUntilContextTimeout(req.Context(), 250*time.Millisecond, 10*time.Second, true, func(pollCtx context.Context) (bool, error) {
+			createErr := ctx.HostClient.Create(pollCtx, newService)
+			if kerrors.IsNotFound(createErr) {
+				return false, nil
+			}
+			return true, createErr
+		})
+	}
 	if err != nil {
 		klog.Infof("Error creating service in physical cluster: %v", err)
 		if kerrors.IsAlreadyExists(err) {
