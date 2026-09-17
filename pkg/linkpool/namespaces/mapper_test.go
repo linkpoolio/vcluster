@@ -7,6 +7,7 @@ import (
 	"github.com/loft-sh/vcluster/pkg/mappings"
 	"github.com/loft-sh/vcluster/pkg/mappings/resources"
 	"github.com/loft-sh/vcluster/pkg/mappings/store"
+	"github.com/loft-sh/vcluster/pkg/pro"
 	"github.com/loft-sh/vcluster/pkg/scheme"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
@@ -66,6 +67,28 @@ func TestMapperVirtualToHost(t *testing.T) {
 	assert.DeepEqual(t, m.VirtualToHost(syncCtx, types.NamespacedName{Name: "kube-system"}, nil), types.NamespacedName{Name: "tenant-cp"})
 	assert.DeepEqual(t, m.VirtualToHost(syncCtx, types.NamespacedName{Name: ""}, nil), types.NamespacedName{})
 	assert.Equal(t, translate.Default.HostNamespace(syncCtx, "kube-system"), "tenant-cp")
+}
+
+func TestLicenseInitSetsMappingsOnly(t *testing.T) {
+	oldName, oldDefault, oldCurrent := translate.VClusterName, translate.Default, current
+	t.Cleanup(func() { translate.VClusterName, translate.Default, current = oldName, oldDefault, oldCurrent })
+	translate.VClusterName = "tenant"
+
+	vConfig := testingutil.NewFakeConfig()
+	vConfig.HostNamespace = "tenant-cp"
+	vConfig.Sync.ToHost.Namespaces.Enabled = true
+	vConfig.Sync.ToHost.Namespaces.MappingsOnly = true
+	vConfig.Sync.ToHost.Namespaces.Mappings.ByName = map[string]string{"team-*": "${name}-team-*"}
+
+	tr, err := pro.GetWithSyncedNamespacesTranslator("tenant-cp", vConfig.Sync.ToHost.Namespaces.Mappings)
+	assert.NilError(t, err)
+	translate.Default = tr
+
+	// before LicenseInit the control plane namespace is still a target (mappingsOnly unknown)
+	assert.Assert(t, tr.IsTargetedNamespace(nil, "tenant-cp"))
+	assert.NilError(t, pro.LicenseInit(context.TODO(), vConfig))
+	assert.Assert(t, !tr.IsTargetedNamespace(nil, "tenant-cp"))
+	assert.Equal(t, tr.HostNamespace(nil, "kube-system"), "")
 }
 
 func TestMapperMappingsOnly(t *testing.T) {
