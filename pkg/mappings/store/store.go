@@ -264,6 +264,22 @@ func (s *Store) objectExists(ctx context.Context, nameMapping synccontext.NameMa
 	return false
 }
 
+// dropUnverifiedReferences removes references that no longer pass verifyMapping, e.g. references into a host
+// namespace that is not a sync target anymore. They would otherwise pin the referenced objects to stale host names.
+func (s *Store) dropUnverifiedReferences(mapping *Mapping) {
+	if s.verifyMapping == nil {
+		return
+	}
+
+	references := make([]synccontext.NameMapping, 0, len(mapping.References))
+	for _, reference := range mapping.References {
+		if s.verifyMapping(reference) {
+			references = append(references, reference)
+		}
+	}
+	mapping.References = references
+}
+
 func (s *Store) start(ctx context.Context) error {
 	s.m.Lock()
 	defer s.m.Unlock()
@@ -278,6 +294,7 @@ func (s *Store) start(ctx context.Context) error {
 		if s.verifyMapping != nil && !s.verifyMapping(mapping.NameMapping) {
 			continue
 		}
+		s.dropUnverifiedReferences(mapping)
 
 		oldMapping, ok := s.mappings[mapping.NameMapping]
 		if ok {
@@ -325,6 +342,9 @@ func (s *Store) handleEvent(ctx context.Context, watchEvent BackendWatchResponse
 		// verify mapping if needed
 		if event.Type == BackendWatchEventTypeUpdate && s.verifyMapping != nil && !s.verifyMapping(event.Mapping.NameMapping) {
 			continue
+		}
+		if event.Type == BackendWatchEventTypeUpdate {
+			s.dropUnverifiedReferences(event.Mapping)
 		}
 
 		klog.FromContext(ctx).V(1).Info("mapping store received event", "type", event.Type, "mapping", event.Mapping.String())

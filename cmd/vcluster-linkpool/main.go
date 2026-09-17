@@ -1,0 +1,22 @@
+// vcluster-linkpool is the upstream vcluster binary with LinkPool's replacements for pro-gated features linked in.
+package main
+
+import (
+	"github.com/loft-sh/vcluster/cmd/vcluster/cmd"
+
+	// pro feature replacements register themselves in init()
+	_ "github.com/loft-sh/vcluster/pkg/linkpool/namespaces"
+
+	// Make sure dep tools picks up these dependencies
+	_ "github.com/go-openapi/loads"
+	_ "k8s.io/apimachinery/pkg/apis/meta/v1"
+	_ "k8s.io/client-go/plugin/pkg/client/auth" // Enable cloud provider auth
+	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
+
+	// Required for sqlite database migration
+	_ "modernc.org/sqlite"
+)
+
+func main() {
+	cmd.RunRoot()
+}
