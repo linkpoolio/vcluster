@@ -6,6 +6,7 @@ import (
 
 	// pro feature replacements register themselves in init()
 	_ "github.com/loft-sh/vcluster/pkg/linkpool/namespaces"
+	_ "github.com/loft-sh/vcluster/pkg/linkpool/patches"
 
 	// Make sure dep tools picks up these dependencies
 	_ "github.com/go-openapi/loads"
