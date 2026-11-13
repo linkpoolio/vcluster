@@ -3,7 +3,9 @@ package setup
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"time"
 
 	vclusterconfig "github.com/loft-sh/vcluster/config"
@@ -19,6 +21,7 @@ import (
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	"github.com/loft-sh/vcluster/pkg/telemetry"
 	"github.com/loft-sh/vcluster/pkg/util/blockingcacheclient"
+	"github.com/loft-sh/vcluster/pkg/util/namespaces"
 	"github.com/loft-sh/vcluster/pkg/util/pluginhookclient"
 	"github.com/pkg/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -119,6 +122,15 @@ func getLocalCacheOptions(options *config.VirtualClusterConfig) cache.Options {
 	if !options.Sync.ToHost.Namespaces.Enabled {
 		defaultNamespaces[options.HostNamespace] = cache.Config{}
 		gatewayNamespaces = gatewaySourceNamespaces(options)
+	} else if mapped := mappedHostNamespaces(options); mapped != nil {
+		// only exact namespace mappings are synced, so the syncer never needs
+		// objects outside of these namespaces and RBAC can stay namespaced
+		defaultNamespaces = mapped
+		gatewayNamespaces = gatewaySourceNamespaces(options)
+		klog.Infof("Restricting host cache to namespaces %v", slices.Sorted(maps.Keys(mapped)))
+	} else {
+		// synced namespaces are not known up front
+		return cache.Options{DefaultNamespaces: nil}
 	}
 	// do we need access to another namespace to export the kubeconfig ?
 	// we will need access to all the objects that the vcluster usually has access to
@@ -144,6 +156,26 @@ func getLocalCacheOptions(options *config.VirtualClusterConfig) cache.Options {
 	}
 
 	return cacheOptions
+}
+
+// mappedHostNamespaces returns the host namespaces the syncer works in when
+// namespace sync only allows exact mappings, or nil if they are not known up
+// front.
+func mappedHostNamespaces(options *config.VirtualClusterConfig) map[string]cache.Config {
+	namespaceSync := options.Sync.ToHost.Namespaces
+	if !namespaceSync.Enabled || !namespaceSync.MappingsOnly || len(namespaceSync.Mappings.ByName) == 0 {
+		return nil
+	}
+
+	hostNamespaces := map[string]cache.Config{options.HostNamespace: {}}
+	for virtualNamespace, hostNamespace := range namespaceSync.Mappings.ByName {
+		if namespaces.IsPattern(virtualNamespace) || namespaces.IsPattern(hostNamespace) {
+			return nil
+		}
+		hostNamespaces[namespaces.ProcessNamespaceName(hostNamespace, options.Name)] = cache.Config{}
+	}
+
+	return hostNamespaces
 }
 
 func startPlugins(ctx context.Context, virtualConfig *rest.Config, virtualRawConfig *clientcmdapi.Config, options *config.VirtualClusterConfig) error {
